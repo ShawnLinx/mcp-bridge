@@ -84,8 +84,11 @@ export class McpWrappers {
   static searchProject(args, callback) {
 		const { query, useRegex, path: searchPath, matchType, extensions } = args;
 
-		// 默认值
-		const rootPathUrl = searchPath || "db://assets";
+		// 默认值；db:// 根路径等同于 db://assets
+		let rootPathUrl = searchPath || "db://assets";
+		if (rootPathUrl === "db://" || rootPathUrl === "db:") {
+			rootPathUrl = "db://assets";
+		}
 		const rootPath = Editor.assetdb.urlToFspath(rootPathUrl);
 
 		if (!rootPath || !fs.existsSync(rootPath)) {

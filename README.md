@@ -263,7 +263,7 @@ mcp-bridge/
 ### 20. search_project
 
 - **描述**: 搜索项目文件（支持正则、文件名、目录名）
-- **参数**: `query`, `useRegex`, `path`, `matchType`, `extensions`, `includeSubpackages`
+- **参数**: `query`, `useRegex`, `path`（默认为 `db://assets`，传入 `db://` 会自动纠正为 `db://assets`）, `matchType`, `extensions`, `includeSubpackages`
 
 ### 21. manage_undo
 

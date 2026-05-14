@@ -2,6 +2,15 @@
 
 本文件详细记录了本次开发周期内的所有功能更新、性能改进以及关键问题的修复过程。
 
+## `search_project` 搜索路径兜底修复 (2026-05-14)
+
+### 1. `db://` 根路径自动纠正为 `db://assets`
+
+- **问题**: 用户在 `search_project` 工具中使用 `path: "db://"` 进行搜索时，`Editor.assetdb.urlToFspath("db://")` 返回无效路径，导致报错"无效的搜索路径: db://"。
+- **修复**: 在 `McpWrappers.ts` 的 `searchProject` 方法中增加路径规范化逻辑。当 `searchPath` 为 `"db://"` 或 `"db:"` 时，自动纠正为 `"db://assets"`，确保搜索能够正常执行。
+
+---
+
 ## 新增功能与工具 (2026-02-10)
 
 ### 1. `manage_shader` 工具 (新增)

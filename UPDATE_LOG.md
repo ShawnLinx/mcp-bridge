@@ -1,5 +1,24 @@
 # 更新日志 (UPDATE_LOG)
 
+## [1.2.2] - 2026-05-29
+### Fixed
+- **预制体根节点错误修复**: 修复 `create_prefab` / `prefab_management` 创建的预制体内部根节点永远为 Canvas 而非目标节点的问题。
+  > **根因分析**：`Editor.serialize(node)` 在 Cocos Creator 2.x 中会从场景根节点开始序列化整个场景树，无论传入哪个节点，序列化输出的第一个 `cc.Node` 始终是场景根节点（Canvas）。后处理管线以第一个 `cc.Node` 作为预制体根节点，导致预制体内部永远包含 Canvas 及其完整祖先链。
+  > **修复方案**：在 scene-script 的 `create-prefab` 中，调用 `Editor.serialize()` 之前将目标节点临时 detach（`node.parent = null`），欺骗序列化器使其仅序列化目标节点及其子树。序列化完成后立即恢复 `node.parent` 和 `node.name`，保证场景状态不受影响。同时将节点重命名逻辑从不可靠的异步 IPC（`scene:set-property` + `setTimeout(300ms)`）移至 scene-script 内部同步执行，消除竞态条件。
+
+### Changed
+- **`_createPrefabViaSceneScript` 签名变更**: 新增 `nodeName` 参数，传递给 scene-script 的 `create-prefab` 方法，用于在序列化前同步设置根节点名称。
+- **移除异步重命名**: `create_prefab` 和 `prefab_management` (create) 两个入口不再通过 `Editor.Ipc.sendToPanel("scene", "scene:set-property", ...)` 异步重命名节点，改为由 scene-script 内部同步处理。
+
+## [1.2.1] - 2026-05-20
+### Fixed
+- **刷新编辑器死锁修复**: 彻底解决 `refresh_editor` 对目录级路径执行 `Editor.assetdb.refresh()` 导致编辑器卡死的问题。
+  > **根因分析**：`Editor.assetdb.refresh()` 在可可斯内部通过 `fastGlob.sync` 同步扫描目录，对脚本目录会触发 TypeScript 编译，编译产物写入 `library/` 后被 chokidar 文件监听器检测到，触发内部 `_processChanges` → `syncChanges` → 再次调用 `tasks.refresh()`，形成 **刷新 → 编译 → 写入 → 检测 → 刷新** 的级联循环。每次循环都阻塞主线程，持续数分钟直至编辑器彻底卡死。
+  > **修复方案**：`refresh_editor` 增加文件后缀名检测（`pathModule.extname`），目录级路径（无后缀）直接拒绝并返回明确错误提示，仅允许单文件刷新。同时完善 `CommandQueue` 超时清理机制（`onTimeout` 回调）和 HTTP 响应保护（`responseSent` 标志），防止连接悬挂。
+
+### Changed
+- **工具描述更新**: `manage_editor` 的 `refresh_editor` 描述从"建议指定路径"改为"硬性限制：仅接受单文件路径，目录路径已被代码层拒绝"。
+
 ## [1.1.0] - 2026-04-05
 ### Feature
 - **截图工具**: 新增 `capture_editor_screenshot` 工具，可以通过向编辑器发送缩放 IPC `scene:init-scene-view` 后截图，为 AI 提供全局场景搭建反馈机制。

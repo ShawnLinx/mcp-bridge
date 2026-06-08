@@ -2,6 +2,147 @@
 
 本文件详细记录了本次开发周期内的所有功能更新、性能改进以及关键问题的修复过程。
 
+## 离线预制体修改工具 (2026-06-08)
+
+### 问题背景
+
+为了在 Cocos Creator 2.4.x 环境下完整对接并实现参考项目 [cc-3-8-x-mcp](https://github.com/HappyLifeOk/cc-3-8-x-mcp) 针对 3.8.x 版本所提供的 26 个离线预制体原子修改命令，我们在本插件中实现了全功能的离线预制体修改引擎。
+
+原本要修改预制体的内容，AI 必须调用 `open_prefab` 打开预制体编辑模式，并在完成属性修改后，调用 `save_prefab` 和 `close_prefab` 退出。这套在线流程强依赖 Cocos 编辑器的运行态，当遇到复杂的预制体时，不仅极其缓慢（每次操作需耗时数秒），而且极易因渲染进程卡死或 IPC 消息冲突发生死锁。
+
+### 修复方案与原理
+
+引入了 `modify_prefab_offline` 工具，实现无需打开编辑器预制体窗口即可直接修改、克隆、重排序和删除节点组件的机制，100% 覆盖了参考项目 [cc-3-8-x-mcp](https://github.com/HappyLifeOk/cc-3-8-x-mcp) 提供的所有离线编辑能力。为解决物理读写与复杂层级引用的健壮性，进行了如下深层优化：
+
+1. **全生命周期原子操作**：在主进程中实现了 `OfflinePrefabEditor` 类，直接通过纯 Node.js 处理平铺 JSON 对象。支持 8 大声明式核心原子操作。
+2. **防移位克隆与深拷贝引用重算**：在 `clone_node` 操作中，提取目标子树包含的所有对象，追加到平铺 JSON 尾部。利用映射表重算子树内部所有的 `__id__` 相对引用，而将子树外部的引用原样保留。
+3. **全深度递归引用重算（致命卡死修复）**：在 `remove_node` 和 `remove_component` 操作中，抛弃了会导致引擎崩溃的 `null` 占位方案，采用物理 `splice` 删除元素并全面启用深度递归重映射 `remapAllIdRefs` 算法。这不仅重排了扁平属性的 `__id__` 指向，也彻底递归更新了如 `clickEvents`、`Widget` 等深度嵌套属性/数组中的引用，杜绝了反序列化越界崩溃。
+4. **无中生有去套娃与根节点寻址容错**：优化了离线新建预制体时的逻辑。写入骨架后自动 `shift()` 剔除首个用于创建根节点的冗余 `add_node` 操作；并在寻址中对带根节点名称前缀的路径加入智能剔除，彻底消除了寻址歧义。
+5. **补全原生节点默认属性**：在新创建的节点及空骨架中，补齐 `_eulerAngles`、`_skewX`、`_skewY`、`_is3DNode`、`_groupIndex`、`groupIndex` 等原生基础属性，确保在 Cocos 2.4.x 中的完美兼容。
+6. **非阻塞异步重载机制（防止死锁）**：本地物理文件写入成功后立即向 MCP 工具队列回调成功并释放锁，而对于 `Editor.assetdb.refresh` 同步，则通过 `setTimeout` 延迟 200 毫秒异步触发。这消除了 Watcher 与插件在主线程中争夺文件锁的微秒级竞态死锁，彻底解决了编辑器卡在“检查文件更新”与 MCP 超时强释队列的死锁顽疾。
+7. **属性引用连线绑定**：在 `set_reference` 操作中，支持直接对属性关联外部资源 `{__uuid__: "..."}`，或通过相对路径动态定位内部其它节点或组件的相对 `__id__` 索引进行写入。
+
+### 改动范围
+
+| 文件 | 修改性质 | 详细内容 |
+|------|------|------|
+| `src/utils/OfflinePrefabEditor.ts` | 修改 | 重构 8 大声明式操作；**实现 `remapAllIdRefs` 深度递归引用重算算法**，解决 `clickEvents` 等嵌套属性引用损坏；在 `findNodeByPath` 中加入根节点前缀智能过滤。 |
+| `src/tools/ToolDispatcher.ts` | 修改 | 在“无中生有”骨架落盘后，**执行 `args.operations.shift()` 剔除首个冗余 add_node 操作**解决根套娃；在空骨架中补全原生属性。 |
+| `src/tools/ToolRegistry.ts` | 修改 | 扩展工具 `inputSchema` 以暴露新动作参数描述及字段映射约束。 |
+
+---
+
+## 预制体根节点错误修复 (2026-05-29)
+
+### 问题背景
+
+AI 调用 `create_prefab` 或 `prefab_management` (action=create) 创建预制体时，保存的 `.prefab` 文件名正确（如 `HomeView.prefab`），但文件内部根节点始终是 Canvas 而非目标节点。例如场景结构为 `Canvas → ViewManager → HomeView → TitleLabel`，期望以 HomeView 为根创建预制体，但实际预制体内部包含完整的 `Canvas → ViewManager → HomeView → TitleLabel` 祖先链。
+
+### 根因分析
+
+`Editor.serialize(node)` 在 Cocos Creator 2.x 中的行为是**从场景根节点开始序列化整个场景树**，而非仅序列化传入的 `node` 及其子树。序列化输出的 JSON 数组中，第一个 `cc.Node` 始终是场景根节点（Canvas），其 `_parent` 指向 `cc.Scene`。
+
+后处理管线（9 步转换）的逻辑是：
+1. 找到 `_parent.__id__` 指向 `cc.Scene` 的节点作为预制体根节点
+2. 由于 Canvas 的 `_parent` 指向 `cc.Scene`，Canvas 被识别为根
+3. Canvas 以下的完整子树被保留
+
+因此无论传入哪个目标节点，预制体根永远锁定为 Canvas。
+
+同时，原先的节点重命名使用异步 IPC `Editor.Ipc.sendToPanel("scene", "scene:set-property", ...)` + `setTimeout(300ms)`，存在 IPC 竞态风险（重命名在 scene panel 进程执行，序列化经由 `Editor.Scene.callSceneScript` 走另一条 IPC 通道），`prefab_management` 入口甚至完全无延迟等待。
+
+### 修复内容
+
+| 文件 | 修改 |
+|------|------|
+| `src/scene-script.ts` | `create-prefab` handler: 序列化前临时 detach 节点 (`node.parent = null`)，序列化后立即恢复 `node.parent` 和 `node.name`；新增 `nodeName` 参数支持同步重命名 |
+| `src/tools/ToolDispatcher.ts` | `_createPrefabViaSceneScript` 新增 `nodeName` 参数；`create_prefab` 入口移除异步 IPC 重命名 + setTimeout，直接传 `nodeName`；`prefabManagement` (create) 入口同样移除异步重命名，传 `prefabName` |
+
+### 核心修复代码
+
+```javascript
+// scene-script.ts: create-prefab handler
+// 保存原始状态
+const originalParent = node.parent;
+const originalName = node.name;
+
+// 临时 detach：欺骗 Editor.serialize 使其仅序列化目标节点及其子树
+node.parent = null;
+if (nodeName) node.name = nodeName;
+
+const serializedStr = Editor.serialize(node);
+
+// 立即恢复，保证场景状态不受影响
+node.parent = originalParent;
+node.name = originalName;
+```
+
+### 设计权衡
+
+不采用在 ToolDispatcher 层面增加更长 `setTimeout` 延迟的方案，因为：
+1. 无法根本解决 `Editor.serialize` 序列化整个场景树的问题
+2. IPC 异步延迟是启发式的，不同机器/负载下表现不一致
+3. 在 scene-script 内部同步 detach/rename/serialize/restore 是唯一能 100% 保证正确性的方案
+
+### 验证
+
+通过 MCPTest 项目实测：创建 `Canvas → ViewManager → HomeView(含Sprite) → TitleLabel(含Label)` 结构，以 HomeView (UUID: `4dFvcOwftDLoTiUFzWXqe6`) 为节点创建 `HomeView.prefab`。
+
+验证结果：
+- 预制体文件 `cc.Prefab.data.__id__` 指向索引 1 的 `cc.Node`
+- 索引 1 节点 `_name: "HomeView"`, `_parent: null` ✓
+- 索引 2 节点 `_name: "TitleLabel"`, `_parent.__id__: 1` ✓
+- 无 Canvas / ViewManager 祖先节点 ✓
+- 根节点 `cc.PrefabInfo.fileId` 已正确填充 ✓
+- 场景中 HomeView 节点名称和父子关系未受影响 ✓
+
+---
+
+## refresh_editor 编辑器卡死修复 (2026-05-20)
+
+### 问题背景
+
+AI 调用 `refresh_editor` 时传入目录级路径（如 `db://assets/_script`），`Editor.assetdb.refresh()` 耗时 60-95 秒并导致编辑器彻底卡死，只能强制关闭。
+
+### 根因分析（结合编辑器源码 `D:\Cocos\Editor\cocos-creator\resources\app\asset-db\`）
+
+通过解包 Cocos Creator 编辑器源码，完整追踪了 `Editor.assetdb.refresh()` 的内部执行链路：
+
+1. **`interface.js:refresh()`** → 将请求推入 `_tasks` 队列（并发度=1）
+2. **`tasks.js:F()`** 分四个阶段执行：
+   - `b()`: `fastGlob.sync("**/*")` 同步扫描目录所有文件（阻塞主线程）
+   - `$()`: 逐个检查文件是否需要重新导入
+   - `S()`: 对每个脚本文件调用导入器 → **触发 TypeScript 编译**
+   - `w()`: 后处理
+3. 编译在 worker 进程中异步执行，产物写入 `library/imports/`
+4. **chokidar** 文件监听器（`watch.js`）检测到写入事件
+5. 事件进入 `ChangeCollector`（200ms debounce）→ `syncChanges()`
+6. `_processChanges` 推入 `_tasks` 队列 → 第 91 行调用 **`tasks.refresh(assetdb, updates)`**
+7. 回到步骤 2，形成 **refresh → compile → write → watcher → refresh** 闭环级联
+
+**每次循环都在主线程执行 `fastGlob.sync` 和 `fs.statSync`，持续数分钟不释放。**
+
+### 与手动改脚本切回编辑器的对比
+
+手动修改脚本后切回编辑器，走的是 `submitChanges()` 中的 **fsnap 快照对比**（非 chokidar），只检测到用户修改的 1 个文件。级联链条长度仅 2-3 节（文件刷新 → 编译 → library 文件同步），总耗时约 1 秒，无感。
+
+插件刷新 200 个文件的目录时，级联链条可达 10-20 节，每节都阻塞主线程，最终导致编辑器死亡。
+
+### 修复内容
+
+| 文件 | 修改 |
+|------|------|
+| `src/core/CommandQueue.ts` | `enqueue` 新增 `onTimeout` 可选回调参数，超时时执行清理逻辑并正确关闭 HTTP 连接 |
+| `src/core/McpRouter.ts` | 传入超时清理函数，发送 504 错误响应；新增 `responseSent` 标志防止超时后重复写入响应 |
+| `src/tools/ToolDispatcher.ts` | `refresh_editor` 新增 `pathModule.extname()` 检查，**目录级路径（无后缀名）直接拒绝并返回明确错误提示**，仅允许单文件刷新 |
+| `src/tools/ToolRegistry.ts` | 更新 `manage_editor` 工具描述，从"建议指定路径"改为"硬性限制：目录路径已被代码层拒绝" |
+
+### 设计权衡
+
+不采用 `setTimeout` 异步化方案的原因：异步化破坏了 `CommandQueue` 的串行保证（`callback` 在刷新执行前就释放了队列锁），后续命令可能与刷新并发执行，引入竞态条件。在级联链条的**起点**阻止目录级刷新是唯一安全的方案。
+
+---
+
 ## Claude Code 技能体系搭建 (2026-05-14)
 
 ### 1. 新增 6 个 Claude Code 技能

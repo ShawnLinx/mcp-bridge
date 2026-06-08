@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { Logger } from '../core/Logger';
 import { AssetPatcher } from '../utils/AssetPatcher';
+import { OfflinePrefabEditor } from '../utils/OfflinePrefabEditor';
 import { CommandQueue } from '../core/CommandQueue';
 import { McpWrappers } from '../core/McpWrappers';
 declare const Editor: any;
@@ -328,19 +329,8 @@ export class ToolDispatcher {
 					prefabUrl = `db://assets/${nodeName}.prefab`;
 				}
 
-				// 先重命名节点以匹配预制体名称
-				Editor.Ipc.sendToPanel("scene", "scene:set-property", {
-					id: args.nodeId,
-					path: "name",
-					type: "String",
-					// 注意：节点名称不允许带有斜杠，使用纯标识符名称
-					value: nodeName,
-					isSubProp: false,
-				});
-				// 【修复】使用自定义 9 步后处理管线：Editor.serialize() → 移除 cc.Scene → 添加 cc.Prefab/cc.PrefabInfo → 清空 _id
-				setTimeout(() => {
-					ToolDispatcher._createPrefabViaSceneScript(args.nodeId, prefabUrl, callback);
-				}, 300);
+				// 节点重命名已移至 scene-script 的 create-prefab 中同步执行，消除 IPC 竞态
+				ToolDispatcher._createPrefabViaSceneScript(args.nodeId, prefabUrl, nodeName, callback);
 				break;
 			}
 
@@ -540,6 +530,104 @@ export class ToolDispatcher {
 				});
 				break;
 
+			case "modify_prefab_offline": {
+				const prefabFsPath = Editor.assetdb.urlToFspath(args.prefabUrl);
+				if (!prefabFsPath) {
+					return callback(`预制体路径解析失败: ${args.prefabUrl}`);
+				}
+
+				// 支持离线无中生有自动新建：文件不存在，且第一个 action 为 add_node 且 targetPath 为空/根
+				if (!fs.existsSync(prefabFsPath)) {
+					const firstOp = args.operations[0];
+					if (firstOp && firstOp.action === "add_node" && (!firstOp.targetPath || firstOp.targetPath === "" || firstOp.targetPath === "/")) {
+						// 写入最简空预制体模板骨架，根节点将在 modify 解析时通过 add_node 动态追加
+						const emptyPrefabSkeleton = `[
+  {
+    "__type__": "cc.Prefab",
+    "_name": "",
+    "_objFlags": 0,
+    "_native": "",
+    "data": { "__id__": 1 },
+    "optimizationPolicy": 0,
+    "asyncLoadAssets": false,
+    "readonly": false
+  },
+  {
+    "__type__": "cc.Node",
+    "_name": "${firstOp.nodeName || 'NewPrefab'}",
+    "_objFlags": 0,
+    "_parent": null,
+    "_children": [],
+    "_components": [],
+    "_active": true,
+    "_prefab": { "__id__": 2 },
+    "_opacity": 255,
+    "_color": { "__type__": "cc.Color", "r": 255, "g": 255, "b": 255, "a": 255 },
+    "_contentSize": { "__type__": "cc.Size", "width": 100, "height": 100 },
+    "_anchorPoint": { "__type__": "cc.Vec2", "x": 0.5, "y": 0.5 },
+    "_trs": {
+      "__type__": "TypedArray",
+      "ctor": "Float64Array",
+      "array": [ 0, 0, 0, 0, 0, 0, 1, 1, 1, 1 ]
+    },
+    "_eulerAngles": { "__type__": "cc.Vec3", "x": 0, "y": 0, "z": 0 },
+    "_skewX": 0,
+    "_skewY": 0,
+    "_is3DNode": false,
+    "_groupIndex": 0,
+    "groupIndex": 0,
+    "_id": ""
+  },
+  {
+    "__type__": "cc.PrefabInfo",
+    "root": { "__id__": 1 },
+    "asset": { "__id__": 0 },
+    "fileId": "${OfflinePrefabEditor.generateFileId()}",
+    "sync": false
+  }
+]`;
+						// 预写入物理路径，使其进入常规解析流程
+						try {
+							const parentDir = pathModule.dirname(prefabFsPath);
+							if (!fs.existsSync(parentDir)) {
+								fs.mkdirSync(parentDir, { recursive: true });
+							}
+							fs.writeFileSync(prefabFsPath, emptyPrefabSkeleton, "utf8");
+							// 剔除第一个冗余的 add_node 操作，因为它已经通过空骨架体现为根节点
+							args.operations.shift();
+						} catch (e) {
+							return callback(`无中生有初始化预制体失败: ${(e as Error).message}`);
+						}
+					} else {
+						return callback(`预制体物理文件不存在: ${args.prefabUrl}，且不满足离线自动新建条件`);
+					}
+				}
+
+				const result = OfflinePrefabEditor.modify(prefabFsPath, args.operations);
+				if (!result.success) {
+					return callback(`离线修改预制体失败: ${result.error}`);
+				}
+
+				// 自动修复 fileId，确保预制体可用
+				AssetPatcher.fixPrefabRootFileId(prefabFsPath);
+
+				// 【核心修复：非阻塞刷新】
+				// 物理落盘成功后，立即向 MCP 返回成功以释放锁，防止卡死与超时
+				callback(null, `成功离线修改预制体: ${args.prefabUrl}，物理数据已安全落盘。`);
+
+				// 异步进行资产重载，避免与主进程/Watcher 产生同步 I/O 竞态
+				setTimeout(() => {
+					if (Editor && Editor.assetdb) {
+						Editor.assetdb.refresh(args.prefabUrl, (err) => {
+							if (err) {
+								console.warn(`[mcp-bridge] 离线修改后刷新资产失败: ${err.message}`);
+							}
+						});
+					}
+				}, 200);
+				break;
+			}
+
 			default:
 				callback(`Unknown tool: ${name}`);
 				break;
@@ -560,8 +648,8 @@ export class ToolDispatcher {
 	 * @param {Function} callback 完成回调 (err, result)
 	 */
 
-  static _createPrefabViaSceneScript(nodeId, prefabUrl, callback) {
-		CommandQueue.callSceneScriptWithTimeout("mcp-bridge", "create-prefab", { nodeId }, (err, serializedData) => {
+  static _createPrefabViaSceneScript(nodeId, prefabUrl, nodeName, callback) {
+		CommandQueue.callSceneScriptWithTimeout("mcp-bridge", "create-prefab", { nodeId, nodeName }, (err, serializedData) => {
 			if (err) {
 				// addLog("error", `[create-prefab] 序列化节点失败: ${err}`);
 				return callback(err);
@@ -917,23 +1005,9 @@ export default class NewScript extends cc.Component {
 				const fileName = prefabPath.substring(prefabPath.lastIndexOf("/") + 1);
 				const prefabName = fileName.replace(".prefab", "");
 
-				// 1. 重命名节点以匹配预制体名称
-				Editor.Ipc.sendToPanel("scene", "scene:set-property", {
-					id: nodeId,
-					path: "name",
-					type: "String",
-					value: prefabName,
-					isSubProp: false,
-				});
-
-				// 2.【修复】使用自定义序列化替代内置 scene:create-prefab，避免根节点 PrefabInfo 损坏
-				// _createPrefabViaSceneScript 内部调用 Editor.assetdb.create()，
-				// 前置通过 _ensureParentDir 等待真实目录建立完备
+				// 节点重命名已移至 scene-script 的 create-prefab 中同步执行，消除 IPC 竞态
 				const createdPrefabUrl = `${targetDir}/${prefabName}.prefab`;
-
-				// 对于预制体，_createPrefabViaSceneScript 需要在内部采用 _safeCreateAsset
-				// 所以我们这里直接调用，将逻辑下放到内部
-				ToolDispatcher._createPrefabViaSceneScript(nodeId, createdPrefabUrl, callback);
+				ToolDispatcher._createPrefabViaSceneScript(nodeId, createdPrefabUrl, prefabName, callback);
 				break;
 
 			case "save": // 兼容 AI 幻觉
@@ -1016,16 +1090,20 @@ export default class NewScript extends cc.Component {
 				break;
 			case "refresh_editor":
 				// 刷新编辑器资源数据库
-				// 支持指定路径以避免大型项目全量刷新耗时过长
-				// 示例: properties.path = 'db://assets/scripts/MyScript.ts' (刷新单个文件)
-				//        properties.path = 'db://assets/resources' (刷新某个目录)
-				//        不传 (默认 'db://assets'，全量刷新)
 				const refreshPath = properties && properties.path ? properties.path : "db://assets";
-				// addLog("info", `[refresh_editor] 开始刷新: ${refreshPath}`);
+				// 安全检查：检测是否为目录级刷新（无文件后缀的路径），目录级刷新会阻塞
+				// 编辑器主线程数分钟，且对脚本目录会触发 compile→refresh→compile 级联循环，
+				// 导致编辑器彻底卡死。只允许刷新单个文件（有后缀名）。
+				const hasExtension = pathModule.extname(refreshPath) !== "";
+				if (!hasExtension) {
+					const hint = refreshPath === "db://assets"
+						? "全局刷新 db://assets 会阻塞编辑器数分钟。请仅刷新具体修改的文件路径（如 db://assets/scripts/MyScript.ts）。"
+						: `目录级刷新 "${refreshPath}" 会阻塞编辑器主线程，且可能触发编译级联卡死。请仅刷新该目录下具体修改的单个文件。`;
+					return callback(hint);
+				}
 				Editor.assetdb.refresh(refreshPath, (err) => {
 					if (err) {
-						// addLog("error", `刷新失败: ${err}`);
-						callback(err);
+						callback(`刷新失败: ${err}`);
 					} else {
 						callback(null, `编辑器已刷新: ${refreshPath}`);
 					}

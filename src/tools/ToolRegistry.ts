@@ -292,7 +292,7 @@ export const getToolsList = () => {
 					properties: {
 						type: "object",
 						description:
-							"操作属性。⚠️极为重要：refresh_editor 必须通过 properties.path 指定精确的刷新路径（如 'db://assets/scripts/MyScript.ts'）。严禁不带 path 参数进行全局刷新 (db://assets)，这在大型项目中会导致编辑器卡死数分钟，严重阻塞工作流。",
+							"操作属性。⚠️硬性限制：refresh_editor 仅接受单文件路径（带后缀名如 'db://assets/scripts/MyScript.ts'）。目录路径和 db://assets 全局路径已被代码层拒绝，传入将直接报错。这是因为目录级刷新会阻塞编辑器主线程数分钟并触发编译级联卡死。修改多个文件后请逐个刷新。",
 					},
 				},
 				required: ["action"],
@@ -597,5 +597,42 @@ export const getToolsList = () => {
 			description: `获取当前项目的宏观信息，例如引擎版本、根目录、当前打开的场景等。`,
 			inputSchema: { type: "object", properties: {} },
 		},
+		{
+			name: "modify_prefab_offline",
+			description: `【离线高效预制体修改】在不打开编辑器预制体窗口的情况下，直接通过底层的 JSON 结构修改预制体数据，并刷新 AssetDB。支持 update_property, add_component, remove_component, add_node, remove_node, clone_node, reorder_child, set_reference 操作。如果预制体文件本身不存在且第一个基动作为 add_node 且 targetPath 为空，则工具将无中生有自动初始化空预制体。`,
+			inputSchema: {
+				type: "object",
+				properties: {
+					prefabUrl: { type: "string", description: "预制体在项目中的相对路径，如 db://assets/prefabs/MyPrefab.prefab" },
+					operations: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: {
+								action: { type: "string", enum: ["update_property", "add_component", "remove_component", "add_node", "remove_node", "clone_node", "reorder_child", "set_reference"] },
+								targetPath: { type: "string", description: "节点相对根节点的查找路径，用 '/' 分割，如 'Root/Body/Label'。对于 add_node 这是父节点的路径。" },
+								componentType: { type: "string", description: "组件类名，在增删改查组件时传入，如 'cc.Label'。修改节点自身属性时不传。" },
+								properties: { type: "object", description: "属性键值对 (update_property/add_component 属性值)" },
+								nodeName: { type: "string", description: "新节点或克隆后节点的名称 (add_node/clone_node 使用)" },
+								newParentPath: { type: "string", description: "克隆节点要挂载的父节点相对路径，不传默认挂在同级 (clone_node 使用)" },
+								childOrder: { type: "array", items: { type: "string" }, description: "子节点名称排序数组 (reorder_child 使用)" },
+								propertyName: { type: "string", description: "要绑定引用的组件属性名 (set_reference 使用)" },
+								referenceValue: {
+									type: "object",
+									description: "绑定的引用的目标值 (set_reference 使用)",
+									properties: {
+										uuid: { type: "string", description: "外部资源的 UUID" },
+										path: { type: "string", description: "要关联引用的预制体内部节点的路径" },
+										componentType: { type: "string", description: "要关联引用的特定组件类名，若绑定节点本身则留空" }
+									}
+								}
+							},
+							required: ["action"]
+						}
+					}
+				},
+				required: ["prefabUrl", "operations"]
+			}
+		}
 	];
 };

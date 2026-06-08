@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { Logger } from '../core/Logger';
 import { AssetPatcher } from '../utils/AssetPatcher';
+import { OfflinePrefabEditor } from '../utils/OfflinePrefabEditor';
 import { CommandQueue } from '../core/CommandQueue';
 import { McpWrappers } from '../core/McpWrappers';
 declare const Editor: any;
@@ -528,6 +529,104 @@ export class ToolDispatcher {
 					callback(err, info);
 				});
 				break;
+
+			case "modify_prefab_offline": {
+				const prefabFsPath = Editor.assetdb.urlToFspath(args.prefabUrl);
+				if (!prefabFsPath) {
+					return callback(`预制体路径解析失败: ${args.prefabUrl}`);
+				}
+
+				// 支持离线无中生有自动新建：文件不存在，且第一个 action 为 add_node 且 targetPath 为空/根
+				if (!fs.existsSync(prefabFsPath)) {
+					const firstOp = args.operations[0];
+					if (firstOp && firstOp.action === "add_node" && (!firstOp.targetPath || firstOp.targetPath === "" || firstOp.targetPath === "/")) {
+						// 写入最简空预制体模板骨架，根节点将在 modify 解析时通过 add_node 动态追加
+						const emptyPrefabSkeleton = `[
+  {
+    "__type__": "cc.Prefab",
+    "_name": "",
+    "_objFlags": 0,
+    "_native": "",
+    "data": { "__id__": 1 },
+    "optimizationPolicy": 0,
+    "asyncLoadAssets": false,
+    "readonly": false
+  },
+  {
+    "__type__": "cc.Node",
+    "_name": "${firstOp.nodeName || 'NewPrefab'}",
+    "_objFlags": 0,
+    "_parent": null,
+    "_children": [],
+    "_components": [],
+    "_active": true,
+    "_prefab": { "__id__": 2 },
+    "_opacity": 255,
+    "_color": { "__type__": "cc.Color", "r": 255, "g": 255, "b": 255, "a": 255 },
+    "_contentSize": { "__type__": "cc.Size", "width": 100, "height": 100 },
+    "_anchorPoint": { "__type__": "cc.Vec2", "x": 0.5, "y": 0.5 },
+    "_trs": {
+      "__type__": "TypedArray",
+      "ctor": "Float64Array",
+      "array": [ 0, 0, 0, 0, 0, 0, 1, 1, 1, 1 ]
+    },
+    "_eulerAngles": { "__type__": "cc.Vec3", "x": 0, "y": 0, "z": 0 },
+    "_skewX": 0,
+    "_skewY": 0,
+    "_is3DNode": false,
+    "_groupIndex": 0,
+    "groupIndex": 0,
+    "_id": ""
+  },
+  {
+    "__type__": "cc.PrefabInfo",
+    "root": { "__id__": 1 },
+    "asset": { "__id__": 0 },
+    "fileId": "${OfflinePrefabEditor.generateFileId()}",
+    "sync": false
+  }
+]`;
+						// 预写入物理路径，使其进入常规解析流程
+						try {
+							const parentDir = pathModule.dirname(prefabFsPath);
+							if (!fs.existsSync(parentDir)) {
+								fs.mkdirSync(parentDir, { recursive: true });
+							}
+							fs.writeFileSync(prefabFsPath, emptyPrefabSkeleton, "utf8");
+							// 剔除第一个冗余的 add_node 操作，因为它已经通过空骨架体现为根节点
+							args.operations.shift();
+						} catch (e) {
+							return callback(`无中生有初始化预制体失败: ${(e as Error).message}`);
+						}
+					} else {
+						return callback(`预制体物理文件不存在: ${args.prefabUrl}，且不满足离线自动新建条件`);
+					}
+				}
+
+				const result = OfflinePrefabEditor.modify(prefabFsPath, args.operations);
+				if (!result.success) {
+					return callback(`离线修改预制体失败: ${result.error}`);
+				}
+
+				// 自动修复 fileId，确保预制体可用
+				AssetPatcher.fixPrefabRootFileId(prefabFsPath);
+
+				// 【核心修复：非阻塞刷新】
+				// 物理落盘成功后，立即向 MCP 返回成功以释放锁，防止卡死与超时
+				callback(null, `成功离线修改预制体: ${args.prefabUrl}，物理数据已安全落盘。`);
+
+				// 异步进行资产重载，避免与主进程/Watcher 产生同步 I/O 竞态
+				setTimeout(() => {
+					if (Editor && Editor.assetdb) {
+						Editor.assetdb.refresh(args.prefabUrl, (err) => {
+							if (err) {
+								console.warn(`[mcp-bridge] 离线修改后刷新资产失败: ${err.message}`);
+							}
+						});
+					}
+				}, 200);
+				break;
+			}
 
 			default:
 				callback(`Unknown tool: ${name}`);

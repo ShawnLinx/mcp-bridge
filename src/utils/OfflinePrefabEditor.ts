@@ -61,6 +61,15 @@ export class OfflinePrefabEditor {
 	}
 
 	/**
+	 * 判断平铺 JSON 数组是否为场景文件格式（而非预制体）
+	 * @param data 平铺 of JSON 数组
+	 * @returns 如果首元素为 cc.SceneAsset 则返回 true
+	 */
+	public static isSceneData(data: any[]): boolean {
+		return data[0] && data[0].__type__ === "cc.SceneAsset";
+	}
+
+	/**
 	 * 离线修改预制体主入口
 	 * @param prefabFsPath 预制体文件的绝对物理路径
 	 * @param operations 待执行的操作列表
@@ -77,7 +86,7 @@ export class OfflinePrefabEditor {
 			const data = JSON.parse(content);
 
 			if (!Array.isArray(data) || data.length === 0) {
-				throw new Error("格式错误的预制体 JSON 文件，期待平铺数组");
+				throw new Error("格式错误的资源 JSON 文件，期待平铺数组");
 			}
 
 			// 3. 依次应用操作
@@ -92,7 +101,7 @@ export class OfflinePrefabEditor {
 			}
 			return { success: true };
 		} catch (e) {
-			Logger.error(`[OfflinePrefabEditor] 修改失败，正在回滚物理文件: ${(e as Error).message}`);
+			Logger.error(`[OfflineEditor] 修改失败，正在回滚物理文件: ${(e as Error).message}`);
 			if (fs.existsSync(backupPath)) {
 				try {
 					fs.copyFileSync(backupPath, prefabFsPath);
@@ -214,21 +223,31 @@ export class OfflinePrefabEditor {
 	 * @returns 目标节点在 data 数组中的索引值
 	 */
 	private static findNodeByPath(data: any[], path: string): number {
-		const prefabEntry = data[0];
-		if (!prefabEntry || prefabEntry.__type__ !== "cc.Prefab" || !prefabEntry.data) {
-			throw new Error("格式错误：数组首位未找到 cc.Prefab 根声明入口");
+		const rootEntry = data[0];
+		if (!rootEntry) {
+			throw new Error("格式错误：数组首位未找到有效声明入口");
 		}
 
-		let currentNodeIdx = prefabEntry.data.__id__;
+		let currentNodeIdx = -1;
+		const isScene = this.isSceneData(data);
+
+		if (rootEntry.__type__ === "cc.Prefab" && rootEntry.data) {
+			currentNodeIdx = rootEntry.data.__id__;
+		} else if (rootEntry.__type__ === "cc.SceneAsset" && rootEntry.scene) {
+			currentNodeIdx = rootEntry.scene.__id__;
+		} else {
+			throw new Error(`不支持的离线编辑资源类型: ${rootEntry.__type__}`);
+		}
+
 		if (!path || path === "" || path === "/") {
 			return currentNodeIdx;
 		}
 
 		let segments = path.split("/").filter((s) => s !== "");
 		const rootNode = data[currentNodeIdx];
-		// 智能容错：如果第一个路径段就是根节点的名字，且我们要么没有更多路径段，
-		// 要么根节点下并没有同名的子节点（避免冲突），则跳过根节点名称这一级
-		if (rootNode && segments[0] === rootNode._name) {
+		// 智能容错：对于预制体，如果第一个路径段就是根节点名称，且没有重名冲突，则跳过
+		// 对于场景，寻路起点是 cc.Scene 虚拟节点，其 _name 通常无意义，直接开始匹配子节点
+		if (!isScene && rootNode && segments[0] === rootNode._name) {
 			let hasSameNameChild = false;
 			if (rootNode._children) {
 				for (const childRef of rootNode._children) {
@@ -250,7 +269,7 @@ export class OfflinePrefabEditor {
 				throw new Error(`引用错误：找不到索引为 ${currentNodeIdx} 的节点对象`);
 			}
 			if (!node._children) {
-				throw new Error(`节点查找失败：节点 ${node._name} (索引 ${currentNodeIdx}) 没有子节点`);
+				throw new Error(`节点查找失败：节点 ${node._name || 'Scene'} (索引 ${currentNodeIdx}) 没有子节点`);
 			}
 
 			let foundIdx = -1;
@@ -394,11 +413,10 @@ export class OfflinePrefabEditor {
 			// 2. 物理删除并对剩余索引及连线引用进行重算，杜绝 null 占位造成的反序列化卡死
 			this.physicalEraseAndRealign(data, [foundCompIdx]);
 		} else if (op.action === "add_node") {
-			// 新增节点并追加配套 PrefabInfo
+			const isScene = this.isSceneData(data);
 			const newNodeIdx = data.length;
-			const prefabInfoIdx = newNodeIdx + 1;
 
-			const newNode = {
+			const newNode: any = {
 				__type__: "cc.Node",
 				_name: op.nodeName || "New Node",
 				_objFlags: 0,
@@ -406,7 +424,7 @@ export class OfflinePrefabEditor {
 				_children: [],
 				_components: [],
 				_active: true,
-				_prefab: { __id__: prefabInfoIdx },
+				_prefab: null,
 				_opacity: 255,
 				_color: { __type__: "cc.Color", "r": 255, "g": 255, "b": 255, "a": 255 },
 				_contentSize: { __type__: "cc.Size", "width": 100, "height": 100 },
@@ -425,16 +443,20 @@ export class OfflinePrefabEditor {
 				_id: ""
 			};
 
-			const newPrefabInfo = {
-				__type__: "cc.PrefabInfo",
-				root: { __id__: data[0].data.__id__ },
-				asset: { __id__: 0 },
-				fileId: this.generateFileId(),
-				sync: false
-			};
-
 			data.push(newNode);
-			data.push(newPrefabInfo);
+
+			if (!isScene) {
+				const prefabInfoIdx = data.length;
+				const newPrefabInfo = {
+					__type__: "cc.PrefabInfo",
+					root: { __id__: data[0].data.__id__ },
+					asset: { __id__: 0 },
+					fileId: this.generateFileId(),
+					sync: false
+				};
+				data.push(newPrefabInfo);
+				newNode._prefab = { __id__: prefabInfoIdx };
+			}
 
 			if (!node._children) {
 				node._children = [];

@@ -2,6 +2,33 @@
 
 本文件详细记录了本次开发周期内的所有功能更新、性能改进以及关键问题的修复过程。
 
+## 离线场景修改工具 - 支持场景文件 (.fire) 修改 (2026-07-01)
+
+### 问题背景
+
+之前实现的离线预制体修改工具（`modify_prefab_offline`）极大提升了大语言模型修改、创建节点组件的工作效率与稳定性。然而，面对大批量的场景配置更新或场景节点离线初始化，在线打开场景（`open_scene`）再保存依然可能导致主线程阻塞。我们需要让该离线编辑引擎同样能够支持场景文件（`.fire`）的直接物理读写。
+
+### 修复方案与原理
+
+1. **寻路根起点泛化**：
+   - 场景与预制体在 Cocos Creator 2.x 中均基于平铺的 JSON 对象数组实现，但顶层骨架不同。预制体以 `cc.Prefab` 为首元素并引用唯一根节点，而场景以 `cc.SceneAsset` 为首元素并引用一个 `cc.Scene` 节点容器。
+   - 重构了 `OfflinePrefabEditor.findNodeByPath` 的寻路起点：若检测到入口为 `cc.SceneAsset`，则自动将其引用的 `cc.Scene` 作为寻路根容器。由于 `cc.Scene` 在平铺结构中和普通节点一样拥有 `_children` 属性，后续子树寻路算法得以 100% 共享。
+2. **差异化 PrefabInfo 挂载拦截**：
+   - 在预制体模式下添加子节点（`add_node`）时，强制要求伴随创建并挂载 `cc.PrefabInfo`；而在普通的场景模式下，新增的节点默认没有预制体绑定，`_prefab` 属性必须设为 `null` 且无需在物理数组中插入 `cc.PrefabInfo`。引擎在 `add_node` 时对这两类入口作了精确的差异化判定和安全拦截。
+3. **新增场景分发**：
+   - 注册了 `modify_scene_offline` MCP 工具，与预制体离线修改共享完全相同的 Operations 操作结构；并支持在文件不存在时，自动写入包含 `cc.SceneAsset` 与 `cc.Scene` 的极简场景物理骨架以实现“无中生有”的新建场景能力。
+
+### 改动范围
+
+| 文件 | 修改性质 | 详细内容 |
+|------|------|------|
+| `src/utils/OfflinePrefabEditor.ts` | 修改 | 新增 `isSceneData` 判断；重构 `findNodeByPath` 支持 `cc.SceneAsset` 和 `cc.Prefab` 检索起点；在 `add_node` 中拦截场景下的 `cc.PrefabInfo` 创建。 |
+| `src/tools/ToolDispatcher.ts` | 修改 | 增加对 `modify_scene_offline` case 的路由处理、场景空骨架物理写入及非阻塞刷新资产动作。 |
+| `src/tools/ToolRegistry.ts` | 修改 | 注册全新的 `modify_scene_offline` 工具 schema 参数接口描述。 |
+| `UPDATE_LOG.md` | 修改 | 追加离线场景编辑支持的 Feature/Changed 说明。 |
+
+---
+
 ## 离线预制体修改工具 - UUID 压缩与平铺对象提升适配 (2026-06-09)
 
 ### 问题背景

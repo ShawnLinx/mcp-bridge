@@ -1,5 +1,16 @@
 # 更新日志 (UPDATE_LOG)
 
+## [1.2.4] - 2026-07-01
+### Feature
+- **离线场景修改工具 (modify_scene_offline)**:
+  - 新增 `modify_scene_offline` MCP 工具，将离线编辑能力从预制体 (.prefab) 扩展到场景文件 (.fire)。
+  - 泛化 `OfflinePrefabEditor` 引擎，自动识别 `cc.SceneAsset` 与 `cc.Prefab` 两种入口格式，共享全部 8 大声明式原子操作（update_property、add_node、remove_node、clone_node、reorder_child、add_component、remove_component、set_reference）。
+  - 场景模式下新增节点不生成 `cc.PrefabInfo`，避免引擎反序列化报错。
+  - 支持"无中生有"自动创建空场景骨架。
+
+### Changed
+- `OfflinePrefabEditor.findNodeByPath` 重构为双类型入口检测（`cc.Prefab` / `cc.SceneAsset`），保持预制体功能完全向后兼容。
+
 ## [1.2.3] - 2026-06-09
 ### Feature
 - **离线预制体修改工具 (modify_prefab_offline) 重大功能增强**:

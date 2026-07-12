@@ -12,13 +12,19 @@ const getMacAppSupportPath = () => process.env.HOME + '/Library/Application Supp
 const getUserProfilePath = () => process.env.USERPROFILE || process.env.HOME || '';
 const getAppDataDir = () => isWin ? getAppdataPath() : getMacAppSupportPath();
 
+// 如需添加自定义 AI 客户端配置，按以下格式新增一行即可：
+// { name: '显示名称', file: path.join(getUserProfilePath(), '目录', '文件名.json') }
+// 可用路径辅助函数：getUserProfilePath() → %USERPROFILE% 或 $HOME
+//                   getAppDataDir()       → %APPDATA% 或 ~/Library/Application Support
 const targetPaths = [
-    { name: 'Antigravity', file: path.join(getUserProfilePath(), '.gemini', 'antigravity', 'mcp_config.json') },
+    { name: 'Antigravity', file: path.join(getUserProfilePath(), '.gemini', 'config', 'mcp_config.json') },
     { name: 'Cherry Studio', file: path.join(getAppDataDir(), 'cherry-studio', 'mcp.json') },
     { name: 'Claude Code', file: path.join(getUserProfilePath(), '.claude.json') },
     { name: 'Claude Desktop', file: path.join(getAppDataDir(), 'Claude', 'claude_desktop_config.json') },
     { name: 'Cline', file: path.join(getAppDataDir(), 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json') },
     { name: 'CodeBuddy CLI', file: path.join(getUserProfilePath(), '.codebuddy', 'mcp.json') },
+    { name: 'CodeWhale', file: path.join(getUserProfilePath(), '.codewhale', 'mcp.json') },
+    { name: 'Deepseek-TUI', file: path.join(getUserProfilePath(), '.deepseek', 'mcp.json') },
     { name: 'Codex', file: path.join(getUserProfilePath(), '.codex', 'mcp.json') },
     { name: 'Cursor', file: path.join(getUserProfilePath(), '.cursor', 'mcp.json') },
     { name: 'Gemini CLI', file: path.join(getUserProfilePath(), '.gemini', 'mcp.json') },

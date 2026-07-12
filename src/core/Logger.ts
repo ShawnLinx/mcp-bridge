@@ -11,7 +11,7 @@ export class Logger {
 	private static getLogFilePath(): string | null {
 		if (Logger._logFilePath) return Logger._logFilePath;
 		try {
-			if (!Editor || !Editor.assetdb) return null;
+			if (typeof Editor === "undefined" || !Editor || !Editor.assetdb) return null;
 			const assetsPath = Editor.assetdb.urlToFspath("db://assets");
 			if (assetsPath) {
 				const projectRoot = pathModule.dirname(assetsPath);
@@ -55,7 +55,7 @@ export class Logger {
 			Logger.logBuffer = Logger.logBuffer.slice(-1500);
 		}
 
-		if (Editor && Editor.Ipc) {
+		if (typeof Editor !== "undefined" && Editor && Editor.Ipc) {
 			try {
 				Editor.Ipc.sendToPanel("mcp-bridge", "mcp-bridge:on-log", logEntry);
 			} catch (_e) {
@@ -63,9 +63,9 @@ export class Logger {
 			}
 		}
 
-		if (type === "error" && Editor) {
+		if (type === "error" && typeof Editor !== "undefined" && Editor) {
 			Editor.error(`[MCP] ${message}`);
-		} else if (type === "warn" && Editor) {
+		} else if (type === "warn" && typeof Editor !== "undefined" && Editor) {
 			Editor.warn(`[MCP] ${message}`);
 		}
 

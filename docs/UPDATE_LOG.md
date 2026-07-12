@@ -2,6 +2,56 @@
 
 本文件详细记录了本次开发周期内的所有功能更新、性能改进以及关键问题的修复过程。
 
+## 离线编辑引擎全面升级：嵌套引用、_N$ 同步、代理内嵌 (2026-07-12)
+
+### 1. MCP 代理内嵌离线编辑引擎（无需 Cocos Creator 即可使用）
+
+- **问题**: 用户在 Antigravity 等 AI 客户端中配置了 `mcp-proxy.js`，但 `modify_scene_offline` / `modify_prefab_offline` 工具不显示。因为代理仅内置了 `get_active_instances` 和 `set_active_instance` 两个工具，其余全部依赖 Cocos Creator 插件 HTTP 服务。
+- **修复**: 将 `OfflinePrefabEditor` 编译打包进 `mcp-proxy.js`。代理始终在 `tools/list` 中返回离线编辑工具，即使 Cocos Creator 未运行也能使用。智能路由：Cocos 在线时优先转发获得 AssetDB 刷新，离线时直接在代理进程内执行。
+- **项目路径解析**: 通过扫描存活实例缓存项目路径，或通过 `MCP_BRIDGE_PROJECT_PATH` 环境变量手动指定。
+- **改动范围**: 
+
+| 文件 | 修改性质 | 详细内容 |
+|------|----------|----------|
+| `src/mcp-proxy.ts` | 重写 | 内嵌 OfflinePrefabEditor；始终返回离线工具；缓存项目路径；proxy 内实现 executeOfflineEdit 完整离线流程（含无中生有骨架创建）；智能路由 Cocos 在线/离线 |
+| `src/core/Logger.ts` | 修改 | 全局 `typeof Editor !== "undefined"` 预检，使其可在无 Editor 环境的 Node.js 进程中安全运行 |
+
+### 2. 嵌套数组引用绑定（`clickEvents[0].target` 语法）
+
+- **问题**: `set_reference` 和 `update_property` 只能在组件或节点一级设置属性，无法访问嵌套数组内的引用（如 `cc.Button` 的 `clickEvents[0].target`）。
+- **修复**: 新增 `resolveNestedProperty()` 方法，支持数组索引语法 `arrayField[index].subField`。
+- **自动创建数组元素**: 新增 `elementType` 参数，当数组元素不存在时，自动创建指定类型的对象（如 `cc.ClickEvent`）并初始化默认值。
+- **示例**:
+  ```json
+  {
+    "action": "set_reference",
+    "targetPath": "Root/MyButton",
+    "componentType": "cc.Button",
+    "propertyName": "clickEvents[0].target",
+    "elementType": "cc.ClickEvent",
+    "referenceValue": { "path": "Root/TargetNode" }
+  }
+  ```
+- **改动范围**: 
+
+| 文件 | 修改性质 | 详细内容 |
+|------|----------|----------|
+| `src/utils/OfflinePrefabEditor.ts` | 修改 | 新增 `resolveNestedProperty`；更新 `PrefabOperation` 接口增加 `elementType`；在 `update_property` 和 `set_reference` 中全面接入嵌套路径解析 |
+
+### 3. 公有/私有属性序列化同步冲突修复（_N$ 反吞数据终结）
+
+- **问题**: 离线仅写入 `_N$transition` 等私有字段，编辑器检测脚本更新触发重构后，自动同步机制因找不到对应公有属性而重置为默认值，覆盖离线数据。
+- **修复**: 对于写入的每个组件属性 `K`（不以 `_` 或 `_N$` 开头），自动同步写 `_N$K`。覆盖 `update_property`、`add_component`、`set_reference`（uuid 分支）三处。
+- **效果**: `transition` → 同时写入 `_N$transition`，`string` → 同时写入 `_N$string`。编辑器在任何触发性重绘后均能正确读取离线写入数据。
+- **改动范围**: 
+
+| 文件 | 修改性质 | 详细内容 |
+|------|----------|----------|
+| `src/utils/OfflinePrefabEditor.ts` | 修改 | `update_property` 组件分支、`add_component` 属性初始化、`set_reference` uuid 分支均添加 `_N$` 自动同步逻辑 |
+| `src/mcp-proxy.ts` | 修改 | （同文件，工具 schema 中新增 `elementType` 参数描述） |
+
+---
+
 ## 离线场景修改工具 - 支持场景文件 (.fire) 修改 (2026-07-01)
 
 ### 问题背景

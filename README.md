@@ -15,7 +15,7 @@
 - **脚本管理**: 创建、删除、读取、写入脚本文件
 - **批处理执行**: 批量执行多个 MCP 工具操作，提高效率
 - **资产管理**: 创建、删除、移动、获取资源信息
-- **离线预制体/场景修改**: 高速、安全的离线编辑器引擎。自动识别预制体 (`.prefab`) 与场景 (`.fire`) 物理骨架差异。支持从零无中生有创建资源骨架、深拷贝引用重算克隆、渲染层级重排序、属性引用绑定以及物理删除 + 深度递归引用更新防崩溃机制，彻底消除反序列化死锁与 Watcher 阻塞
+- **离线预制体/场景修改**: 高速、安全的离线编辑器引擎。自动识别预制体 (`.prefab`) 与场景 (`.fire`) 物理骨架差异。支持从零无中生有创建资源骨架、深拷贝引用重算克隆、渲染层级重排序、嵌套数组引用绑定（`clickEvents[0].target`）、属性引用绑定以及物理删除 + 深度递归引用更新防崩溃机制，编辑器私有序列化字段（`_N$`）自动同步，彻底消除反序列化死锁与 Watcher 阻塞
 - **实时日志**: 提供详细的操作日志记录和展示，支持持久化写入项目内日志文件
 - **自动启动**: 支持编辑器启动时自动开启服务
 - **编辑器管理**: 获取和设置选中对象，刷新编辑器
@@ -339,14 +339,14 @@ mcp-bridge/
 - **参数**:
     - `prefabUrl` (必需): 预制体资源的 db:// 路径，如 `db://assets/prefabs/MyPrefab.prefab`。对于不存在的文件，若首个操作为 add_node 且路径为空，则触发自动从零新建骨架。
     - `operations` (必需): 操作项列表。支持的原子操作 `action` 包括：
-        - `update_property`: 更新节点/组件属性（properties 传入属性键值对）
-        - `add_component`: 挂载新组件（componentType 指定类名）
+        - `update_property`: 更新节点/组件属性（properties 传入属性键值对。支持数组索引语法如 `clickEvents[0].handler`。组件属性自动同步 `_N$` 私有序列化字段）
+        - `add_component`: 挂载新组件（componentType 指定类名。组件属性自动同步 `_N$` 字段）
         - `remove_component`: 卸载组件（自动物理 splice 删除并递归更新引用）
         - `add_node`: 在 targetPath 下新增子节点（自动补齐 6 大原生属性）
         - `remove_node`: 物理删除节点树（物理 splice 并深度递归重映射所有 __id__ 指向 null，防止越界卡死）
         - `clone_node`: 深拷贝节点子树（使用 indexMap 重排拷贝子树内部所有相对 __id__ 引用）
         - `reorder_child`: 调整子节点渲染顺序（childOrder 传入名称数组，安全合并遗漏项）
-        - `set_reference`: 绑定组件属性引用（通过 referenceValue 属性关联外部 UUID 或内部节点/组件索引）
+        - `set_reference`: 绑定组件属性引用（通过 referenceValue 属性关联外部 UUID 或内部节点/组件索引。支持数组索引语法如 `clickEvents[0].target`，可通过 `elementType: "cc.ClickEvent"` 自动创建嵌套数组元素）
 
 ### 32. modify_scene_offline
 
@@ -389,7 +389,24 @@ Cocos Creator 序列化自定义脚本组件时，物理预制体的 `__type__` 
 Cocos 2.x 的 `cc.ClickEvent` 继承自 `cc.Object`。引擎反序列化规范限制其**不能直接内联**在组件的属性结构中，必须平铺作为平铺数组的独立项，并通过 `{ "__id__": index }` 被引用，且其 `component` 属性在物理文件中应当为空 `""`，并且应当设置特殊的 `_componentId` 为对应脚本的压缩版 UUID。
 为此，本引擎实现了属性自动提升平铺（Lift）机制。当写入 `clickEvents` 等事件属性时，自动识别并创建独立平铺的事件节点，递归计算相对依赖引用并执行引用的重算 realign，完美契合了引擎的反序列化绑定规范。
 
-### 8. 场景与预制体的骨架泛化与差异处理
+### 9. 嵌套数组引用绑定与元素自动创建（`clickEvents[0].target`）
+	本引擎现在支持通过数组索引语法直接访问和修改组件内嵌套数组的属性。当 `set_reference` 或 `update_property` 的 `propertyName` 中包含 `clickEvents[0].target` 这样的路径时，引擎会：
+	1. **解析路径**: 自动识别数组字段名 `clickEvents`、索引 `0`、子属性 `target`。
+	2. **访问数组**: 从组件的属性中获取数组（兼容 `_N$` 前缀序列化版本）。
+	3. **自动创建**: 如果数组或指定索引的元素不存在，利用 `elementType` 参数自动创建（如 `cc.ClickEvent`），初始化默认值并填充平铺数组。
+	4. **解引用**: 自动处理 Cocos 平铺格式的 `{ __id__: N }` 到实际对象的转换。
+	这使得绑定按钮点击事件、设置自定义脚本的数组引用等场景完全可以在离线编辑中完成，无需后处理脚本手动计算索引映射。
+
+### 10. 组件属性 `_N$` 私有序列化字段自动同步
+	Cocos Creator 2.x 引擎在序列化某些组件属性时，内部同时使用公有字段和以 `_N$` 开头的私有序列化字段。编辑器检测到脚本更新并触发重构时，会依赖 `_N$` 字段读取反序列化数据。若缺失，编辑器会重置为默认值，覆盖离线写入的数据。
+	本引擎在 `update_property`、`add_component`、`set_reference` 三处操作中，对每个写入的组件属性 `K`（不以 `_` 或 `_N$` 开头），**自动同步写入 `_N$K`**。确保编辑器在任何触发性重绘后均能正确读取离线写入数据，彻底终结反吞问题。
+
+### 11. MCP 代理内嵌离线引擎（无 Cocos 亦可运行）
+	`mcp-proxy.js` 已内嵌 OfflinePrefabEditor 编译包。当 AI 客户端（如 Antigravity、Claude Code）通过 stdio 连接代理时，`modify_prefab_offline` 和 `modify_scene_offline` 始终出现在工具列表中。
+	- **Cocos 在线模式**: 代理优先将调用转发至 Cocos Creator 插件 HTTP 服务，获得完整的 AssetDB 刷新和编辑器同步能力。
+	- **Cocos 离线模式**: 如果编辑器未运行，代理直接在本进程内执行离线修改。项目路径通过扫描存活实例或 `MCP_BRIDGE_PROJECT_PATH` 环境变量获取。
+
+### 12. 场景与预制体的骨架泛化与差异处理
 本引擎同时支持预制体 (`.prefab`) 与场景 (`.fire`) 的物理修改。通过在 `findNodeByPath` 中自动辨识首位的 `cc.Prefab` 或 `cc.SceneAsset` 类型，动态设置根定位起点（预制体为 `data.__id__`，场景为虚拟根 `scene.__id__`）。此外，在新增节点时，引擎会自动过滤掉场景模式下的 `cc.PrefabInfo` 数据块创建，保障场景文件结构的纯净，完美向后兼容。
 
 ## 开发指南

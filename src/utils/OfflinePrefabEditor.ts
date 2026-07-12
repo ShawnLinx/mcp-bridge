@@ -35,7 +35,8 @@ export interface PrefabOperation {
 	 */
 	childOrder?: string[];
 	/**
-	 * 要绑定引用的组件属性名 (set_reference 使用)
+	 * 要绑定引用的组件属性名 (set_reference 使用)。
+	 * 支持数组索引语法如 "clickEvents[0].target"，用于绑定数组元素内的引用属性。
 	 */
 	propertyName?: string;
 	/**
@@ -46,6 +47,12 @@ export interface PrefabOperation {
 		path?: string;
 		componentType?: string;
 	};
+	/**
+	 * 数组元素类型 (add_component / set_reference 使用)。
+	 * 当 propertyName 使用数组索引语法（如 clickEvents[0].target）且该数组元素尚不存在时，
+	 * 自动创建指定类型的元素。常用值： "cc.ClickEvent"
+	 */
+	elementType?: string;
 }
 
 /**
@@ -154,6 +161,80 @@ export class OfflinePrefabEditor {
 			i += 3;
 		}
 		return prefix + chars.join("");
+	}
+
+	/**
+	 * 解析嵌套属性路径，支持数组索引语法 "clickEvents[0].target"。
+	 * 当路径中存在数组访问且元素不存在时，可根据 elementType 自动创建。
+	 * @returns { target: 最终属性所在的对象, prop: 最终属性名 }
+	 */
+	private static resolveNestedProperty(
+		targetObj: any,
+		propertyName: string,
+		data: any[],
+		elementType?: string
+	): { target: any; prop: string } {
+		// 匹配 "arrayField[index].subField" 模式
+		const arrayMatch = propertyName.match(/^(\w+)\[(\d+)\]\.(.+)$/);
+		if (!arrayMatch) {
+			return { target: targetObj, prop: propertyName };
+		}
+
+		const [, arrayField, indexStr, subField] = arrayMatch;
+		const index = parseInt(indexStr, 10);
+
+		// 尝试访问数组字段（兼容 _N$ 前缀序列化版本）
+		let arr = targetObj[arrayField];
+		if (arr === undefined || arr === null) {
+			arr = targetObj['_N$' + arrayField];
+		}
+
+		// 如果数组不存在，根据 elementType 自动创建
+		if (!Array.isArray(arr)) {
+			if (!elementType) {
+				throw new Error(
+					`属性 "${propertyName}" 寻址失败：组件上不存在数组属性 "${arrayField}"。` +
+					`请提供 elementType 参数来自动创建数组元素（如 "cc.ClickEvent"）。`
+				);
+			}
+			arr = [];
+			targetObj[arrayField] = arr;
+			targetObj['_N$' + arrayField] = arr;
+		}
+
+		// 获取或自动创建数组元素
+		let elementRef = arr[index];
+		if (!elementRef || elementRef === null) {
+			if (!elementType) {
+				throw new Error(
+					`属性 "${propertyName}" 寻址失败：数组 "${arrayField}" 索引 ${index} 不存在。` +
+					`请提供 elementType 参数来自动创建（如 "cc.ClickEvent"）。`
+				);
+			}
+			const newElement: any = { __type__: elementType };
+			// ClickEvent 默认值
+			if (elementType === 'cc.ClickEvent') {
+				newElement.target = null;
+				newElement.component = '';
+				newElement.handler = '';
+			}
+			const newIdx = data.length;
+			data.push(newElement);
+			// 填充数组到目标索引
+			while (arr.length <= index) {
+				arr.push(null);
+			}
+			arr[index] = { __id__: newIdx };
+			elementRef = arr[index];
+		}
+
+		// 解引用扁平数组存储（{ __id__: N } → data[N]）
+		let element = elementRef;
+		if (element && typeof element === 'object' && element.__id__ !== undefined) {
+			element = data[element.__id__];
+		}
+
+		return { target: element, prop: subField };
 	}
 
 	private static liftObject(data: any[], obj: any): any {
@@ -333,11 +414,18 @@ export class OfflinePrefabEditor {
 
 				const component = data[foundCompIdx];
 				for (const [key, val] of Object.entries(op.properties || {})) {
-					const finalKey = propMap[key] || key;
-					component[finalKey] = this.liftObject(data, val);
-					// 智能处理 Label 同步字段：修改 string 时自动同步 _N$string
-					if (key === "string" && compTypeToFind === "cc.Label") {
-						component["_N$string"] = val;
+					// 支持数组索引语法：clickEvents[0].handler → 自动解析到数组元素内
+					const { target: propTarget, prop: resolvedProp } = this.resolveNestedProperty(
+						component, key, data, op.elementType
+					);
+					const finalKey = propMap[resolvedProp] || resolvedProp;
+					const lifted = this.liftObject(data, val);
+					propTarget[finalKey] = lifted;
+					// 智能同步 _N$ 私有序列化字段，防止编辑器重绘时反吞数据
+					// Cocos 编辑器在检测脚本更新并重构时，依赖 _N$ 前缀字段进行反序列化；
+					// 若缺失，编辑器会重置为默认值，覆盖离线写入的数据。
+					if (!resolvedProp.startsWith('_N$') && !resolvedProp.startsWith('_')) {
+						propTarget['_N$' + resolvedProp] = lifted;
 					}
 				}
 			} else {
@@ -375,10 +463,15 @@ export class OfflinePrefabEditor {
 				...defaultProps,
 			};
 
-			// 应用用户传入的属性
+			// 应用用户传入的属性（含 _N$ 智能同步）
 			for (const [key, val] of Object.entries(op.properties || {})) {
 				const finalKey = propMap[key] || key;
-				newComp[finalKey] = this.liftObject(data, val);
+				const lifted = this.liftObject(data, val);
+				newComp[finalKey] = lifted;
+				// 同步 _N$ 前缀的私有序列化字段，防止编辑器重绘时反吞数据
+				if (!key.startsWith('_N$') && !key.startsWith('_')) {
+					newComp['_N$' + key] = lifted;
+				}
 			}
 
 			data.push(newComp);
@@ -633,12 +726,21 @@ export class OfflinePrefabEditor {
 				targetObj = data[foundCompIdx];
 			}
 
+			// 解析 propertyName，支持数组索引语法如 "clickEvents[0].target"
+			// 在所有 ref 分支前解析，确保数组路径在两分支下均生效
+			const { target: propTarget, prop: resolvedProp } = this.resolveNestedProperty(
+				targetObj, op.propertyName, data, op.elementType
+			);
+
 			const ref = op.referenceValue;
 			if (ref.uuid) {
-				// 绑定外部资源
-				targetObj[op.propertyName] = { __uuid__: ref.uuid };
+				// 绑定外部资源（自动同步 _N$ 私有序列化字段）
+				propTarget[resolvedProp] = { __uuid__: ref.uuid };
+				if (!resolvedProp.startsWith('_N$') && !resolvedProp.startsWith('_')) {
+					propTarget['_N$' + resolvedProp] = { __uuid__: ref.uuid };
+				}
 			} else if (ref.path) {
-				// 绑定内部对象
+				// 绑定内部对象（节点或组件）
 				const refNodeIdx = this.findNodeByPath(data, ref.path);
 				if (ref.componentType) {
 					const refCompTypeToFind = this.isUuid(ref.componentType) ? this.compressUuid(ref.componentType) : ref.componentType;
@@ -654,9 +756,9 @@ export class OfflinePrefabEditor {
 					if (refCompIdx === -1) {
 						throw new Error(`连线失败：引用的目标节点下未包含组件 "${ref.componentType}"`);
 					}
-					targetObj[op.propertyName] = { __id__: refCompIdx };
+					propTarget[resolvedProp] = { __id__: refCompIdx };
 				} else {
-					targetObj[op.propertyName] = { __id__: refNodeIdx };
+					propTarget[resolvedProp] = { __id__: refNodeIdx };
 				}
 			}
 		}

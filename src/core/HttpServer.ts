@@ -26,8 +26,8 @@ export class HttpServer {
 				});
 
 				HttpServer.mcpServer.on("error", (e: any) => {
-					if (e.code === "EADDRINUSE") {
-						Logger.warn(`Port ${currentPort} is in use, trying ${currentPort + 1}...`);
+					if (e.code === "EADDRINUSE" || e.code === "EACCES") {
+						Logger.warn(`Port ${currentPort} is ${e.code === "EACCES" ? "access denied (possibly in excluded range)" : "in use"}, trying ${currentPort + 1}...`);
 						try {
 							if (HttpServer.mcpServer) HttpServer.mcpServer.close();
 						} catch (err) {}
@@ -40,7 +40,7 @@ export class HttpServer {
 					}
 				});
 
-				HttpServer.mcpServer.listen(currentPort, () => {
+				HttpServer.mcpServer.listen(currentPort, "127.0.0.1", () => {
 					HttpServer.config.active = true;
 					HttpServer.config.port = currentPort;
 					Logger.success(`MCP Server running at http://127.0.0.1:${currentPort}`);
